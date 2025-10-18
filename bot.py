@@ -1,120 +1,184 @@
+# bot.py
+import os
 import json
+import logging
 from telegram import Update, ChatInviteLink
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ChatMemberHandler
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    ChatMemberHandler,
+)
 
-BOT_TOKEN = "8155195750:AAEdVGfm3_nKBNRQrgifykgRnw02OZWVPio"
-CHANNEL_ID = -1003126728590
-ADMIN_ID = 8361737480
+# ---------- Logging ----------
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Config from environment ----------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
+ADMIN_ID = os.environ.get("ADMIN_ID")
+
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN is not set. Set the BOT_TOKEN environment variable.")
+    raise SystemExit("BOT_TOKEN is required")
+
+try:
+    CHANNEL_ID = int(CHANNEL_ID) if CHANNEL_ID is not None else None
+except ValueError:
+    logger.error("CHANNEL_ID must be an integer (e.g. -1001234567890).")
+    raise SystemExit("Invalid CHANNEL_ID")
+
+try:
+    ADMIN_ID = int(ADMIN_ID) if ADMIN_ID is not None else None
+except ValueError:
+    logger.error("ADMIN_ID must be an integer (e.g. 8361737480).")
+    raise SystemExit("Invalid ADMIN_ID")
+
+# ---------- Files ----------
 DATA_FILE = "data.json"
 REPORT_FILE = "report.json"
 
-def load_data():
+def load_json(path):
     try:
-        with open(DATA_FILE, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.exception("Failed to load %s: %s", path, e)
         return {}
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-def load_report():
+def save_json(path, obj):
     try:
-        with open(REPORT_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.exception("Failed to save %s: %s", path, e)
 
-def save_report(report):
-    with open(REPORT_FILE, "w") as f:
-        json.dump(report, f, indent=4)
-
-# ===== /start =====
+# ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    data = load_data()
-    if user_id not in data:
-        try:
-            link: ChatInviteLink = await context.bot.create_chat_invite_link(
-                chat_id=CHANNEL_ID,
-                member_limit=0,
-                name=f"link_user_{user_id}"
-            )
-        except Exception as e:
-            await update.message.reply_text(f"خطا در ساخت لینک: {e}")
-            return
+    data = load_json(DATA_FILE)
 
-        data[user_id] = {
-            "invite_link": link.invite_link,
-            "members": {},
-            "count": 0,
-            "completed": False
-        }
-        save_data(data)
-        await update.message.reply_text(
-            f"سلام! لینک اختصاصی شما:\n{link.invite_link}"
-        )
-    else:
+    if user_id in data:
         await update.message.reply_text(
             f"شما قبلاً لینک اختصاصی دارید:\n{data[user_id]['invite_link']}"
         )
-
-# ===== ورود و خروج اعضا =====
-async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    report = load_report()
-
-    chat_member = update.chat_member
-    user_id = str(chat_member.new_chat_member.user.id)
-    status = chat_member.new_chat_member.status
-    invite_link_used = chat_member.invite_link.invite_link if chat_member.invite_link else None
-
-    if not invite_link_used:
         return
+
+    # create invite link
+    try:
+        link: ChatInviteLink = await context.bot.create_chat_invite_link(
+            chat_id=CHANNEL_ID,
+            member_limit=0,
+            name=f"link_user_{user_id}"
+        )
+    except Exception as e:
+        logger.exception("create_chat_invite_link failed for user %s: %s", user_id, e)
+        await update.message.reply_text(f"خطا در ساخت لینک: {e}")
+        return
+
+    data[user_id] = {
+        "invite_link": link.invite_link,
+        "members": {},  # { "member_id_str": True/False }
+        "count": 0,
+        "completed": False
+    }
+    save_json(DATA_FILE, data)
+
+    await update.message.reply_text(
+        f"سلام! لینک اختصاصی شما:\n\n{link.invite_link}\n\n"
+        "هر کسی با این لینک وارد کانال شود، شمارش می‌شود."
+    )
+    logger.info("Created invite link for user %s", user_id)
+
+
+async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ChatMemberUpdated handler
+    chat_member = update.chat_member
+    new_status = chat_member.new_chat_member.status
+    invite_link = chat_member.invite_link.invite_link if chat_member.invite_link else None
+    user = chat_member.new_chat_member.user
+    user_id = str(user.id)
+
+    if not invite_link:
+        # join without an invite link (ignore)
+        logger.debug("Member %s updated without invite_link; status=%s", user_id, new_status)
+        return
+
+    data = load_json(DATA_FILE)
+    report = load_json(REPORT_FILE)
 
     inviter_id = None
     for uid, info in data.items():
-        if info.get("invite_link") == invite_link_used:
+        if info.get("invite_link") == invite_link:
             inviter_id = uid
             break
 
     if not inviter_id:
+        logger.info("Invite link used not found in data: %s", invite_link)
         return
 
     info = data[inviter_id]
 
-    if status == "member":
-        if user_id not in info["members"] or not info["members"][user_id]:
+    # member joined
+    if new_status == "member":
+        already = info["members"].get(user_id, False)
+        if not already:
             info["members"][user_id] = True
-            info["count"] += 1
+            info["count"] = info.get("count", 0) + 1
+            save_json(DATA_FILE, data)
+
             remaining = max(0, 10 - info["count"])
             if info["count"] < 10:
-                await context.bot.send_message(int(inviter_id),
-                    f"{info['count']} نفر از دعوت‌های شما وارد کانال شدند. {remaining} نفر دیگر باقی مانده."
+                await context.bot.send_message(
+                    chat_id=int(inviter_id),
+                    text=f"{info['count']} نفر از دعوت‌های شما وارد کانال شدند. {remaining} نفر دیگر تا جایزه باقی مانده."
                 )
-            elif info["count"] >= 10 and not info["completed"]:
-                info["completed"] = True
-                await context.bot.send_message(int(inviter_id), "تبریک! به ۱۰ دعوت موفق رسیدید 🎉")
-                await context.bot.send_message(ADMIN_ID, f"کاربر {inviter_id} به ۱۰ دعوت موفق رسید.")
-                report[inviter_id] = {"status": "completed", "count": info["count"]}
-                save_report(report)
+            else:
+                if not info.get("completed"):
+                    info["completed"] = True
+                    save_json(DATA_FILE, data)
+                    await context.bot.send_message(
+                        chat_id=int(inviter_id),
+                        text="تبریک! شما به ۱۰ دعوت موفق رسیدید 🎉"
+                    )
+                    if ADMIN_ID:
+                        await context.bot.send_message(
+                            chat_id=ADMIN_ID,
+                            text=f"کاربر {inviter_id} به ۱۰ دعوت موفق رسید."
+                        )
+                    report[inviter_id] = {"status": "completed", "count": info["count"]}
+                    save_json(REPORT_FILE, report)
+            logger.info("Inviter %s: count=%d (joined %s)", inviter_id, info["count"], user_id)
 
-    elif status in ["left", "kicked"]:
-        if user_id in info["members"] and info["members"][user_id]:
+    # member left or was kicked
+    elif new_status in ("left", "kicked"):
+        was_member = info["members"].get(user_id, False)
+        if was_member:
             info["members"][user_id] = False
-            info["count"] -= 1
+            info["count"] = max(0, info.get("count", 0) - 1)
+            save_json(DATA_FILE, data)
+
             remaining = max(0, 10 - info["count"])
-            await context.bot.send_message(int(inviter_id),
-                f"{user_id} کانال را ترک کرد. تعداد دعوت موفق شما اکنون: {info['count']}. {remaining} نفر دیگر باقی مانده."
+            await context.bot.send_message(
+                chat_id=int(inviter_id),
+                text=f"{user_id} کانال را ترک کرد. تعداد دعوت‌های موفق شما اکنون: {info['count']}. {remaining} نفر دیگر تا جایزه باقی مانده."
             )
+            logger.info("Inviter %s: count=%d (left %s)", inviter_id, info["count"], user_id)
 
-    save_data(data)
+    # else ignore other statuses
 
-# ===== اجرای ربات بدون asyncio.run =====
+
+# ---------- App setup ----------
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(ChatMemberHandler(member_update, ChatMemberHandler.CHAT_MEMBER))
 
-print("ربات در حال اجراست...")
-app.run_polling()
+if __name__ == "__main__":
+    logger.info("Starting bot (Render). CHANNEL_ID=%s ADMIN_ID=%s", CHANNEL_ID, ADMIN_ID)
+    app.run_polling()
