@@ -1,184 +1,177 @@
-# bot.py
 import os
-import json
-import logging
+from flask import Flask, request
 from telegram import Update, ChatInviteLink
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    ChatMemberHandler,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from datetime import datetime, timedelta
 
-# ---------- Logging ----------
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ======== تنظیمات ربات ========
+TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 
-# ---------- Config from environment ----------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")
-ADMIN_ID = os.environ.get("ADMIN_ID")
+# ======== راه‌اندازی Flask ========
+app = Flask(__name__)
+application = Application.builder().token(TOKEN).build()
 
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN is not set. Set the BOT_TOKEN environment variable.")
-    raise SystemExit("BOT_TOKEN is required")
+# ======== دیتاست‌ها ========
+user_invite_links = {}
+invite_counts = {}
+mission_completed = set()
+invitee_to_inviter = {}
+mission_start_time = {}
+mission_end_time = {}
 
-try:
-    CHANNEL_ID = int(CHANNEL_ID) if CHANNEL_ID is not None else None
-except ValueError:
-    logger.error("CHANNEL_ID must be an integer (e.g. -1001234567890).")
-    raise SystemExit("Invalid CHANNEL_ID")
-
-try:
-    ADMIN_ID = int(ADMIN_ID) if ADMIN_ID is not None else None
-except ValueError:
-    logger.error("ADMIN_ID must be an integer (e.g. 8361737480).")
-    raise SystemExit("Invalid ADMIN_ID")
-
-# ---------- Files ----------
-DATA_FILE = "data.json"
-REPORT_FILE = "report.json"
-
-def load_json(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        logger.exception("Failed to load %s: %s", path, e)
-        return {}
-
-def save_json(path, obj):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        logger.exception("Failed to save %s: %s", path, e)
-
-# ---------- Handlers ----------
+# ======== فرمان /start ========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    data = load_json(DATA_FILE)
+    await update.message.reply_text("🤖 ربات با موفقیت راه‌اندازی شد! برای شروع، دستور /link را بزنید.")
 
-    if user_id in data:
-        await update.message.reply_text(
-            f"شما قبلاً لینک اختصاصی دارید:\n{data[user_id]['invite_link']}"
-        )
-        return
+application.add_handler(CommandHandler("start", start))
 
-    # create invite link
-    try:
-        link: ChatInviteLink = await context.bot.create_chat_invite_link(
-            chat_id=CHANNEL_ID,
-            member_limit=0,
-            name=f"link_user_{user_id}"
-        )
-    except Exception as e:
-        logger.exception("create_chat_invite_link failed for user %s: %s", user_id, e)
-        await update.message.reply_text(f"خطا در ساخت لینک: {e}")
-        return
+# ======== فرمان ایجاد لینک اختصاصی ========
+async def generate_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
 
-    data[user_id] = {
-        "invite_link": link.invite_link,
-        "members": {},  # { "member_id_str": True/False }
-        "count": 0,
-        "completed": False
-    }
-    save_json(DATA_FILE, data)
-
-    await update.message.reply_text(
-        f"سلام! لینک اختصاصی شما:\n\n{link.invite_link}\n\n"
-        "هر کسی با این لینک وارد کانال شود، شمارش می‌شود."
-    )
-    logger.info("Created invite link for user %s", user_id)
-
-
-async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ChatMemberUpdated handler
-    chat_member = update.chat_member
-    new_status = chat_member.new_chat_member.status
-    invite_link = chat_member.invite_link.invite_link if chat_member.invite_link else None
-    user = chat_member.new_chat_member.user
-    user_id = str(user.id)
-
-    if not invite_link:
-        # join without an invite link (ignore)
-        logger.debug("Member %s updated without invite_link; status=%s", user_id, new_status)
-        return
-
-    data = load_json(DATA_FILE)
-    report = load_json(REPORT_FILE)
-
-    inviter_id = None
-    for uid, info in data.items():
-        if info.get("invite_link") == invite_link:
-            inviter_id = uid
-            break
-
-    if not inviter_id:
-        logger.info("Invite link used not found in data: %s", invite_link)
-        return
-
-    info = data[inviter_id]
-
-    # member joined
-    if new_status == "member":
-        already = info["members"].get(user_id, False)
-        if not already:
-            info["members"][user_id] = True
-            info["count"] = info.get("count", 0) + 1
-            save_json(DATA_FILE, data)
-
-            remaining = max(0, 10 - info["count"])
-            if info["count"] < 10:
-                await context.bot.send_message(
-                    chat_id=int(inviter_id),
-                    text=f"{info['count']} نفر از دعوت‌های شما وارد کانال شدند. {remaining} نفر دیگر تا جایزه باقی مانده."
-                )
-            else:
-                if not info.get("completed"):
-                    info["completed"] = True
-                    save_json(DATA_FILE, data)
-                    await context.bot.send_message(
-                        chat_id=int(inviter_id),
-                        text="تبریک! شما به ۱۰ دعوت موفق رسیدید 🎉"
-                    )
-                    if ADMIN_ID:
-                        await context.bot.send_message(
-                            chat_id=ADMIN_ID,
-                            text=f"کاربر {inviter_id} به ۱۰ دعوت موفق رسید."
-                        )
-                    report[inviter_id] = {"status": "completed", "count": info["count"]}
-                    save_json(REPORT_FILE, report)
-            logger.info("Inviter %s: count=%d (joined %s)", inviter_id, info["count"], user_id)
-
-    # member left or was kicked
-    elif new_status in ("left", "kicked"):
-        was_member = info["members"].get(user_id, False)
-        if was_member:
-            info["members"][user_id] = False
-            info["count"] = max(0, info.get("count", 0) - 1)
-            save_json(DATA_FILE, data)
-
-            remaining = max(0, 10 - info["count"])
-            await context.bot.send_message(
-                chat_id=int(inviter_id),
-                text=f"{user_id} کانال را ترک کرد. تعداد دعوت‌های موفق شما اکنون: {info['count']}. {remaining} نفر دیگر تا جایزه باقی مانده."
+    if user_id in user_invite_links:
+        link = user_invite_links[user_id]
+    else:
+        try:
+            chat_link: ChatInviteLink = await context.bot.create_chat_invite_link(
+                chat_id=CHANNEL_ID,
+                member_limit=0
             )
-            logger.info("Inviter %s: count=%d (left %s)", inviter_id, info["count"], user_id)
+            link = chat_link.invite_link
+            user_invite_links[user_id] = link
+            invite_counts[user_id] = 0
+            mission_start_time[user_id] = datetime.now()
+            mission_end_time[user_id] = datetime.now() + timedelta(days=4)
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطا در ایجاد لینک: {e}")
+            return
 
-    # else ignore other statuses
+    msg = (
+        f"🎯 سلام! یک ماموریت هیجان‌انگیز واست دارم!\n\n"
+        f"کافیه فقط ۱۰ نفر رو با لینک زیر دعوت کنی به کانال 🎉\n\n"
+        f"⏳ تا ۳ روز اول تلاش کن، اگر موفق نشدی یه روز اضافه داری 💪\n"
+        f"🏆 پس از تکمیل ماموریت، تخفیف ۵۰٪ بهت تعلق می‌گیره!\n\n"
+        f"🚀 لینک اختصاصی تو:\n{link}\n\n"
+        f"⏱ فقط ۳ روز فرصت داری، پس سریع شروع کن!"
+    )
+    await update.message.reply_text(msg)
 
+application.add_handler(CommandHandler("link", generate_link))
 
-# ---------- App setup ----------
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(ChatMemberHandler(member_update, ChatMemberHandler.CHAT_MEMBER))
+# ======== فرمان وضعیت لینک‌ها برای ادمین ========
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ شما دسترسی ندارید.")
+        return
 
+    in_progress = []
+    completed = []
+
+    for uid, link in user_invite_links.items():
+        count = invite_counts.get(uid, 0)
+        text = f"👤 کاربر: {uid}\n🔗 لینک: {link}\n✅ دعوت موفق: {count}\n"
+        if uid in mission_completed:
+            completed.append(text)
+        else:
+            in_progress.append(text)
+
+    response = "💡 **در حال ماموریت:**\n" + ("\n".join(in_progress) if in_progress else "هیچ موردی نیست") + "\n\n"
+    response += "🏆 **ماموریت تکمیل شده:**\n" + ("\n".join(completed) if completed else "هیچ موردی نیست")
+
+    await update.message.reply_text(response)
+
+application.add_handler(CommandHandler("status", status))
+
+# ======== مدیریت ورود ========
+async def member_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for member in update.message.new_chat_members:
+        user_id = member.id
+        inviter_id = invitee_to_inviter.get(user_id)
+
+        if inviter_id and inviter_id not in mission_completed:
+            now = datetime.now()
+            if now > mission_end_time.get(inviter_id, now):
+                await context.bot.send_message(inviter_id, "⏰ مهلت ماموریتت تموم شده! برای فرصت دوباره به ادمین پیام بده 📨")
+                continue
+
+            invite_counts[inviter_id] += 1
+            count = invite_counts[inviter_id]
+
+            if count < 10:
+                await context.bot.send_message(inviter_id, f"🎉 عالیه! یکی دیگه اضافه شد. تعداد دعوت موفق: {count}/10 💪 ادامه بده، می‌تونی!")
+            elif count == 10:
+                mission_completed.add(inviter_id)
+                await context.bot.send_message(inviter_id, f"🏆 ترکوندی! ماموریت دعوت ۱۰ نفر کامل شد 🎊\nبرای دریافت جایزه به ادمین پیام بده.")
+                await context.bot.send_message(ADMIN_ID, f"✅ کاربر {inviter_id} ماموریت رو تکمیل کرد.")
+
+application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, member_join))
+
+# ======== مدیریت خروج ========
+async def member_left(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.left_chat_member.id
+    inviter_id = invitee_to_inviter.get(user_id)
+
+    if inviter_id and inviter_id not in mission_completed:
+        invite_counts[inviter_id] -= 1
+        await context.bot.send_message(inviter_id, f"⚠️ یک نفر کانال رو ترک کرد. تعداد دعوت موفق شما شد {invite_counts[inviter_id]}.")
+
+application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, member_left))
+
+# ======== بررسی مهلت ماموریت ========
+async def check_mission_deadlines(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now()
+    for uid, end_time in mission_end_time.items():
+        if uid in mission_completed:
+            continue
+        days_passed = (now - mission_start_time.get(uid, now)).days
+        if days_passed == 3:
+            await context.bot.send_message(uid, "⏳ تلاشتو کردی، یک روز دیگه فرصت داری! 🌟 ادامه بده و ۱۰ نفر رو دعوت کن.")
+        elif now >= end_time:
+            await context.bot.send_message(uid, "🛑 مهلت ماموریتت تموم شد! برای تمدید با ادمین پیام بده.")
+            mission_completed.add(uid)
+
+application.job_queue.run_repeating(check_mission_deadlines, interval=3600, first=10)
+
+# ======== تمدید ماموریت توسط ادمین ========
+async def reactivate_mission(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ فقط ادمین می‌تونه ماموریت رو تمدید کنه.")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ لطفا آیدی عددی کاربر رو وارد کن:\nمثال: /reactivate 123456789")
+        return
+
+    if target_id not in user_invite_links:
+        await update.message.reply_text("❌ همچین کاربری در لیست دعوت‌ها نیست.")
+        return
+
+    # تمدید مهلت برای ۳ روز
+    mission_start_time[target_id] = datetime.now()
+    mission_end_time[target_id] = datetime.now() + timedelta(days=3)
+    if target_id in mission_completed:
+        mission_completed.remove(target_id)
+
+    await update.message.reply_text(f"✅ ماموریت کاربر {target_id} با موفقیت تمدید شد (۳ روز).")
+    await context.bot.send_message(target_id, "🚀 ماموریتت تمدید شد! دوباره دست به کار شو 💪")
+
+application.add_handler(CommandHandler("reactivate", reactivate_mission))
+
+# ======== مسیر وبهوک ========
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put(update)
+    return "ok", 200
+
+@app.route("/")
+def index():
+    return "Bot is running...", 200
+
+# ======== اجرای لوکال ========
 if __name__ == "__main__":
-    logger.info("Starting bot (Render). CHANNEL_ID=%s ADMIN_ID=%s", CHANNEL_ID, ADMIN_ID)
-    app.run_polling()
+    app.run(port=8080)
