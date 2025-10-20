@@ -7,6 +7,7 @@ from telegram.ext import (
 )
 from datetime import datetime, timedelta
 from threading import Thread
+import asyncio
 
 # ======== تنظیمات ربات ========
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -24,9 +25,8 @@ extended_users = set()
 
 # ======== ساخت Application ========
 application = ApplicationBuilder().token(TOKEN).build()
-job_queue = application.job_queue  # JobQueue رو بعد از build استفاده می‌کنیم
 
-# ======== فرمان /start ========
+# ======== فرمان‌ها ========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 ربات با موفقیت راه‌اندازی شد!\n"
@@ -34,7 +34,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 application.add_handler(CommandHandler("start", start))
 
-# ======== ایجاد لینک اختصاصی ========
 async def generate_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in user_invite_links:
@@ -67,7 +66,6 @@ async def generate_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 application.add_handler(CommandHandler("link", generate_link))
 
-# ======== وضعیت برای ادمین ========
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ شما دسترسی ندارید.")
@@ -90,7 +88,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 application.add_handler(CommandHandler("status", status))
 
-# ======== ورود عضو جدید ========
 async def member_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         user_id = member.id
@@ -113,7 +110,6 @@ async def member_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, member_join))
 
-# ======== خروج عضو ========
 async def member_left(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.left_chat_member.id
     inviter_id = invitee_to_inviter.get(user_id)
@@ -123,23 +119,6 @@ async def member_left(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, member_left))
 
-# ======== بررسی مهلت ماموریت ========
-async def check_mission_deadlines(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now()
-    for uid, end_time in mission_end_time.items():
-        if uid in mission_completed:
-            continue
-        days_passed = (now - mission_start_time.get(uid, now)).days
-        if days_passed == 3 and uid not in extended_users:
-            await context.bot.send_message(uid, "⏳ تلاشتو کردی، یک روز دیگه فرصت داری! 🌟 ادامه بده و ۱۰ نفر رو دعوت کن.")
-            extended_users.add(uid)
-        elif now >= end_time:
-            await context.bot.send_message(uid, "🛑 مهلت ماموریتت تموم شد! برای تمدید با ادمین پیام بده.")
-            mission_completed.add(uid)
-
-job_queue.run_repeating(check_mission_deadlines, interval=3600, first=10)
-
-# ======== تمدید ماموریت ========
 async def reactivate_mission(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ فقط ادمین می‌تونه ماموریت رو تمدید کنه.")
@@ -165,6 +144,31 @@ async def reactivate_mission(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 application.add_handler(CommandHandler("reactivate", reactivate_mission))
 
+# ======== بررسی مهلت ماموریت با Thread ========
+async def check_mission_deadlines_loop():
+    while True:
+        now = datetime.now()
+        for uid, end_time in mission_end_time.items():
+            if uid in mission_completed:
+                continue
+            days_passed = (now - mission_start_time.get(uid, now)).days
+            if days_passed == 3 and uid not in extended_users:
+                try:
+                    await application.bot.send_message(uid, "⏳ تلاشتو کردی، یک روز دیگه فرصت داری! 🌟 ادامه بده و ۱۰ نفر رو دعوت کن.")
+                except:
+                    pass
+                extended_users.add(uid)
+            elif now >= end_time:
+                try:
+                    await application.bot.send_message(uid, "🛑 مهلت ماموریتت تموم شد! برای تمدید با ادمین پیام بده.")
+                except:
+                    pass
+                mission_completed.add(uid)
+        await asyncio.sleep(3600)  # یک ساعت
+
+def start_mission_loop():
+    asyncio.run(check_mission_deadlines_loop())
+
 # ======== وبهوک ========
 app = Flask(__name__)
 
@@ -178,10 +182,8 @@ def webhook():
 def index():
     return "Bot is running ✅", 200
 
-# ======== اجرای Flask و PTB ========
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
+# ======== اجرای Flask و ربات ========
 if __name__ == "__main__":
-    Thread(target=run_flask, daemon=True).start()
+    Thread(target=start_mission_loop, daemon=True).start()
+    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000))), daemon=True).start()
     application.run_polling()
