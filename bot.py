@@ -1,8 +1,12 @@
 import os
 from flask import Flask, request
 from telegram import Update, ChatInviteLink
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes,
+    MessageHandler, filters, JobQueue
+)
 from datetime import datetime, timedelta
+from threading import Thread
 
 # ======== تنظیمات ربات ========
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -11,7 +15,7 @@ CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 
 # ======== راه‌اندازی Flask ========
 app = Flask(__name__)
-application = Application.builder().token(TOKEN).build()
+application = ApplicationBuilder().token(TOKEN).build()
 
 # ======== دیتاست‌ها ========
 user_invite_links = {}
@@ -20,10 +24,14 @@ mission_completed = set()
 invitee_to_inviter = {}
 mission_start_time = {}
 mission_end_time = {}
+extended_users = set()
 
 # ======== فرمان /start ========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 ربات با موفقیت راه‌اندازی شد! برای شروع، دستور /link را بزنید.")
+    await update.message.reply_text(
+        "🤖 ربات با موفقیت راه‌اندازی شد!\n"
+        "برای شروع، دستور /link را بزنید."
+    )
 
 application.add_handler(CommandHandler("start", start))
 
@@ -37,7 +45,8 @@ async def generate_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             chat_link: ChatInviteLink = await context.bot.create_chat_invite_link(
                 chat_id=CHANNEL_ID,
-                member_limit=0
+                member_limit=0,
+                creates_join_request=False
             )
             link = chat_link.invite_link
             user_invite_links[user_id] = link
@@ -51,7 +60,7 @@ async def generate_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"🎯 سلام! یک ماموریت هیجان‌انگیز واست دارم!\n\n"
         f"کافیه فقط ۱۰ نفر رو با لینک زیر دعوت کنی به کانال 🎉\n\n"
-        f"⏳ تا ۳ روز اول تلاش کن، اگر موفق نشدی یه روز اضافه داری 💪\n"
+        f"⏳ تا ۳ روز اول تلاش کن، اگه موفق نشدی یه روز اضافه داری 💪\n"
         f"🏆 پس از تکمیل ماموریت، تخفیف ۵۰٪ بهت تعلق می‌گیره!\n\n"
         f"🚀 لینک اختصاصی تو:\n{link}\n\n"
         f"⏱ فقط ۳ روز فرصت داری، پس سریع شروع کن!"
@@ -86,9 +95,15 @@ application.add_handler(CommandHandler("status", status))
 
 # ======== مدیریت ورود ========
 async def member_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    inviter_id = None
     for member in update.message.new_chat_members:
         user_id = member.id
-        inviter_id = invitee_to_inviter.get(user_id)
+        # بررسی اینکه چه کسی دعوت کرده (اختیاری: دستی ست کن یا دیتاست جداگانه)
+        inviter_id = None
+        for inv_id, link in user_invite_links.items():
+            if link in update.message.text if update.message.text else "":
+                inviter_id = inv_id
+                break
 
         if inviter_id and inviter_id not in mission_completed:
             now = datetime.now()
@@ -112,7 +127,6 @@ application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, me
 async def member_left(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.left_chat_member.id
     inviter_id = invitee_to_inviter.get(user_id)
-
     if inviter_id and inviter_id not in mission_completed:
         invite_counts[inviter_id] -= 1
         await context.bot.send_message(inviter_id, f"⚠️ یک نفر کانال رو ترک کرد. تعداد دعوت موفق شما شد {invite_counts[inviter_id]}.")
@@ -125,14 +139,18 @@ async def check_mission_deadlines(context: ContextTypes.DEFAULT_TYPE):
     for uid, end_time in mission_end_time.items():
         if uid in mission_completed:
             continue
+
         days_passed = (now - mission_start_time.get(uid, now)).days
-        if days_passed == 3:
+        if days_passed == 3 and uid not in extended_users:
             await context.bot.send_message(uid, "⏳ تلاشتو کردی، یک روز دیگه فرصت داری! 🌟 ادامه بده و ۱۰ نفر رو دعوت کن.")
+            extended_users.add(uid)
         elif now >= end_time:
             await context.bot.send_message(uid, "🛑 مهلت ماموریتت تموم شد! برای تمدید با ادمین پیام بده.")
             mission_completed.add(uid)
 
-application.job_queue.run_repeating(check_mission_deadlines, interval=3600, first=10)
+# فعال کردن JobQueue به شکل درست ✅
+job_queue = application.job_queue
+job_queue.run_repeating(check_mission_deadlines, interval=3600, first=10)
 
 # ======== تمدید ماموریت توسط ادمین ========
 async def reactivate_mission(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -150,18 +168,19 @@ async def reactivate_mission(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ همچین کاربری در لیست دعوت‌ها نیست.")
         return
 
-    # تمدید مهلت برای ۳ روز
     mission_start_time[target_id] = datetime.now()
     mission_end_time[target_id] = datetime.now() + timedelta(days=3)
     if target_id in mission_completed:
         mission_completed.remove(target_id)
+    if target_id in extended_users:
+        extended_users.remove(target_id)
 
     await update.message.reply_text(f"✅ ماموریت کاربر {target_id} با موفقیت تمدید شد (۳ روز).")
     await context.bot.send_message(target_id, "🚀 ماموریتت تمدید شد! دوباره دست به کار شو 💪")
 
 application.add_handler(CommandHandler("reactivate", reactivate_mission))
 
-# ======== مسیر وبهوک ========
+# ======== وبهوک ========
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
@@ -170,8 +189,12 @@ def webhook():
 
 @app.route("/")
 def index():
-    return "Bot is running...", 200
+    return "Bot is running ✅", 200
 
-# ======== اجرای لوکال ========
+# ======== اجرای Flask در Thread ========
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
 if __name__ == "__main__":
-    app.run(port=8080)
+    Thread(target=run_flask).start()
+    application.run_polling()
